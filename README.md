@@ -1,4 +1,4 @@
-# Reach-the-Goal-423
+# Reach-the-Goal
 
 We're planning to make a game where a player has to make him save from thorns coming towards him and to reach the top of the arena. 
 Arena - 15X15 ground
