@@ -1,4 +1,4 @@
-# Thorn Escape - Clean Working Version
+# Thorn Escape - Full Working Version (P1 + P2 + P3 merged & fixed)
 # pip install PyOpenGL PyOpenGL_accelerate
 
 from OpenGL.GL import *
@@ -8,19 +8,17 @@ import random
 import time
 import math
 
-# ---------------- SETTINGS ----------------
 WINDOW_W = 1000
 WINDOW_H = 800
 
-GRID = 15
-GRID_LENGTH = 600
+GRID = 20
+GRID_LENGTH = 800          
 CELL = (2 * GRID_LENGTH) / GRID
 
-camera_pos = [0, -900, 850]
+camera_pos = [0, -1250, 1050]  
 
-# ---------------- GAME STATE ----------------
-player_row = 14
-player_col = 7
+player_row = GRID - 1
+player_col = GRID // 2
 
 lives = 3
 score = 0
@@ -29,18 +27,28 @@ game_over = False
 reason = ""
 
 thorn_positions = []
-thorn_speed = 3.0
+thorn_speed = 10.0
 last_wave = time.time()
 
 collectibles = []
 last_gem = time.time()
 
 hide_start = None
-HIDE_LIMIT = 3
+HIDE_LIMIT = 3         
 
+game_start_time = time.time()   
 prev_time = time.time()
 
-# ---------------- HELPERS ----------------
+invincible_until = 0.0  # brief i-frames after any damage event (thorn or shield)
+I_FRAME_TIME = 1.0
+
+MAX_THORN_SPEED = 20.0
+
+last_move_time = 0.0
+MOVE_COOLDOWN = 0.10    
+
+SHIELD_BLOCK_RADIUS = 38  
+
 def grid_to_world(row, col, z=20):
     x = -GRID_LENGTH + (col + 0.5) * CELL
     y = GRID_LENGTH - (row + 0.5) * CELL
@@ -69,7 +77,7 @@ def draw_text(x, y, txt):
     glMatrixMode(GL_MODELVIEW)
 
 
-# ---------------- DRAW ----------------
+
 def draw_arena():
     for r in range(GRID):
         for c in range(GRID):
@@ -95,7 +103,12 @@ def draw_player():
     glPushMatrix()
     glTranslatef(x, y, z)
 
-    glColor3f(0, 0, 1)
+    # flash the player while invincible so damage feedback is visible
+    if time.time() < invincible_until and int(time.time() * 8) % 2 == 0:
+        glColor3f(1, 1, 1)
+    else:
+        glColor3f(0, 0, 1)
+
     glutSolidCube(40)
 
     glTranslatef(0, 0, 35)
@@ -134,13 +147,26 @@ def draw_gems():
         glPopMatrix()
 
 
-# ---------------- SHIELDS ----------------
 shield_walls = [
-    {"r": 10, "c": 3},
-    {"r": 8, "c": 10},
-    {"r": 5, "c": 6},
-    {"r": 3, "c": 12},
+    {"r": 14, "c": 4,  "axis": "col", "min": 1,  "max": 8,  "speed": 0.8, "t": 0.0},
+    {"r": 11, "c": 14, "axis": "col", "min": 9,  "max": 18, "speed": 1.1, "t": 1.0},
+    {"r": 7,  "c": 8,  "axis": "row", "min": 3,  "max": 10, "speed": 0.9, "t": 2.0},
+    {"r": 4,  "c": 16, "axis": "row", "min": 1,  "max": 7,  "speed": 1.0, "t": 3.0},
 ]
+
+
+def update_shields(dt):
+    for s in shield_walls:
+        s["t"] += dt * s["speed"]
+        # ping-pong between min and max using a triangle wave
+        span = s["max"] - s["min"]
+        phase = (math.sin(s["t"]) + 1) / 2  # 0..1
+        pos = int(round(s["min"] + phase * span))
+
+        if s["axis"] == "col":
+            s["c"] = pos
+        else:
+            s["r"] = pos
 
 
 def draw_shields():
@@ -163,7 +189,15 @@ def inside_shield():
     return False
 
 
-# ---------------- THORNS ----------------
+def thorn_blocked_by_shield(t):
+    # Thorns should not pass through a wall -- destroy them on contact
+    for s in shield_walls:
+        sx, sy, _ = grid_to_world(s["r"], s["c"], 0)
+        if math.hypot(t["x"] - sx, t["y"] - sy) < SHIELD_BLOCK_RADIUS:
+            return True
+    return False
+
+
 def spawn_wave():
     global thorn_positions, last_wave
 
@@ -172,45 +206,53 @@ def spawn_wave():
     direction = random.choice(["horizontal", "vertical"])
 
     if direction == "horizontal":
+        # spawn from the left edge, travel right across the arena
         for i in range(6):
-            row = random.randint(0, 14)
+            row = random.randint(0, GRID - 1)
             x, y, _ = grid_to_world(row, 0)
-            thorn_positions.append({"x": x, "y": y, "dx": thorn_speed, "dy": 0})
+            thorn_positions.append({"x": x, "y": y, "dx": thorn_speed, "dy": 5})
 
     else:
+        # spawn from the top edge, travel down across the arena
         for i in range(6):
-            col = random.randint(0, 14)
-            x, y, _ = grid_to_world(14, col)
+            col = random.randint(0, GRID - 1)
+            x, y, _ = grid_to_world(0, col)
             thorn_positions.append({"x": x, "y": y, "dx": 0, "dy": -thorn_speed})
 
     last_wave = time.time()
 
 
-# ---------------- GEMS ----------------
 def spawn_gem():
-    row = random.randint(1, 13)
-    col = random.randint(0, 14)
+    row = random.randint(1, GRID - 2)
+    col = random.randint(0, GRID - 1)
     collectibles.append((row, col))
 
 
-# ---------------- COLLISION ----------------
 def check_collisions():
-    global lives, game_over, reason, score
+    global lives, game_over, reason, score, invincible_until
 
+    now = time.time()
     px, py, _ = grid_to_world(player_row, player_col)
 
-    # thorn hit
-    for t in thorn_positions:
-        d = math.hypot(px - t["x"], py - t["y"])
-        if d < 35:
-            if not inside_shield():
-                lives -= 1
-                thorn_positions.clear()
-                if lives <= 0:
-                    game_over = True
-                    reason = "No lives left"
+    # thorn hit -- only if not currently shielded and not in i-frames
+    if now >= invincible_until and not inside_shield():
+        hit_thorn = None
+        for t in thorn_positions:
+            d = math.hypot(px - t["x"], py - t["y"])
+            if d < 35:
+                hit_thorn = t
+                break
 
-    # gem collect
+        if hit_thorn is not None:
+            lives -= 1
+            invincible_until = now + I_FRAME_TIME
+            thorn_positions.remove(hit_thorn)   # remove only the thorn that hit
+            if lives <= 0:
+                lives = 0
+                game_over = True
+                reason = "No lives left"
+
+    # gem collect (always allowed, no i-frame needed)
     newlist = []
     for g in collectibles:
         gx, gy, _ = grid_to_world(g[0], g[1])
@@ -222,10 +264,9 @@ def check_collisions():
     collectibles[:] = newlist
 
 
-# ---------------- UPDATE ----------------
 def update():
     global prev_time, thorn_speed, win, score
-    global hide_start, game_over, reason, last_gem
+    global hide_start, game_over, reason, last_gem, invincible_until, lives
 
     if game_over or win:
         glutPostRedisplay()
@@ -235,9 +276,13 @@ def update():
     dt = now - prev_time
     prev_time = now
 
-    thorn_speed = 3 + int(now // 20)
+    # difficulty scaling based on ELAPSED game time, not epoch time
+    elapsed = now - game_start_time
+    thorn_speed = min(3 + elapsed / 20.0, MAX_THORN_SPEED)
 
-    # thorn wave every second
+    update_shields(dt)
+
+    
     if now - last_wave > 1 and len(thorn_positions) == 0:
         spawn_wave()
 
@@ -249,6 +294,8 @@ def update():
 
         if abs(t["x"]) > GRID_LENGTH + 100 or abs(t["y"]) > GRID_LENGTH + 100:
             remove.append(t)
+        elif thorn_blocked_by_shield(t):
+            remove.append(t)   # wall stops the thorn -- it cannot pass through
 
     for r in remove:
         thorn_positions.remove(r)
@@ -258,34 +305,80 @@ def update():
         spawn_gem()
         last_gem = now
 
-    # shield timer
+    # shield overstay -- costs a life instead of instant game over,
+    # consistent with the single lives-based damage rule
     if inside_shield():
         if hide_start is None:
             hide_start = now
         elif now - hide_start > HIDE_LIMIT:
-            game_over = True
-            reason = "Stayed in shield too long"
+            if now >= invincible_until:
+                lives -= 1
+                invincible_until = now + I_FRAME_TIME
+                if lives <= 0:
+                    lives = 0
+                    game_over = True
+                    reason = "Overstayed in shield"
+            hide_start = now  # restart the grace window
     else:
         hide_start = None
 
     check_collisions()
 
     # win
-    if player_row == 0:
+    if player_row == 0 and not game_over:
         win = True
         score += 10
 
     glutPostRedisplay()
 
 
-# ---------------- INPUT ----------------
+def reset_game():
+    global player_row, player_col, lives, score, win, game_over, reason
+    global thorn_positions, thorn_speed, last_wave, collectibles, last_gem
+    global hide_start, game_start_time, prev_time, invincible_until
+
+    player_row = GRID - 1
+    player_col = GRID // 2
+
+    lives = 3
+    score = 0
+    win = False
+    game_over = False
+    reason = ""
+
+    thorn_positions = []
+    thorn_speed = 3.0
+    last_wave = time.time()
+
+    collectibles = []
+    last_gem = time.time()
+
+    hide_start = None
+    game_start_time = time.time()
+    prev_time = time.time()
+    invincible_until = 0.0
+
+
+
 def keyboard(key, x, y):
-    global player_row, player_col, score
+    global player_row, player_col, score, last_move_time
+
+    key = key.decode().lower()
+
+    if key == 'r':
+        reset_game()
+        return
+
+    if key == '\x1b':  # ESC
+        glutLeaveMainLoop()
+        return
 
     if game_over or win:
         return
 
-    key = key.decode().lower()
+    now = time.time()
+    if now - last_move_time < MOVE_COOLDOWN:
+        return  # ignore key-repeat spam so the player moves at a controlled pace
 
     moved = False
 
@@ -293,7 +386,7 @@ def keyboard(key, x, y):
         player_row -= 1
         moved = True
 
-    elif key == 's' and player_row < 14:
+    elif key == 's' and player_row < GRID - 1:
         player_row += 1
         moved = True
 
@@ -301,22 +394,24 @@ def keyboard(key, x, y):
         player_col -= 1
         moved = True
 
-    elif key == 'd' and player_col < 14:
+    elif key == 'd' and player_col < GRID - 1:
         player_col += 1
         moved = True
 
     if moved:
         score += 1
+        last_move_time = now
 
 
 def special(key, x, y):
+    # Person 1: camera can be moved up/down
     if key == GLUT_KEY_UP:
         camera_pos[2] += 20
     elif key == GLUT_KEY_DOWN:
         camera_pos[2] -= 20
 
 
-# ---------------- DISPLAY ----------------
+
 def display():
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     glLoadIdentity()
@@ -335,18 +430,22 @@ def display():
 
     draw_text(20, 760, f"Score: {score}")
     draw_text(20, 730, f"Lives: {lives}")
+    draw_text(20, 700, f"Speed: {thorn_speed:.1f}")
+    draw_text(20, 20, "WASD move | Up/Down = camera | R = restart | ESC = quit")
 
     if win:
         draw_text(420, 760, "YOU WIN!")
+        draw_text(380, 730, "Press R to play again")
 
     if game_over:
         draw_text(400, 760, "GAME OVER")
         draw_text(360, 730, reason)
+        draw_text(360, 700, "Press R to play again")
 
     glutSwapBuffers()
 
 
-# ---------------- MAIN ----------------
+
 def init():
     glClearColor(0, 0, 0, 1)
     glEnable(GL_DEPTH_TEST)
@@ -362,6 +461,7 @@ def main():
     glutCreateWindow(b"Thorn Escape")
 
     init()
+    reset_game()
 
     glutDisplayFunc(display)
     glutIdleFunc(update)
